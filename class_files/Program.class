@@ -1,0 +1,488 @@
+<?php
+
+class Program {
+
+    public $db_id;
+    public $name;
+    public $credit;
+    public $catalog_url;
+    public $level;
+    public $minor_req;
+    public $sub_options;
+    public $master_group;
+    public $groupList = array();
+    public $courseList = array();
+    public $full_course_list = array();
+    public $atomics;
+    public $filter_groups;
+
+    // Constructor
+    public function __construct($id) {
+        $data = DB::query_array("SELECT * FROM `program` WHERE programID='" . $id . "' LIMIT 1");
+        $this->db_id = $data['programID'];
+        $this->name = $data['name'];
+        $this->catalog_url = $data['catalogURL'];
+        $this->level = $data['level'];
+        $this->minor_req = ($data['minor'] == '1');
+        $this->master_group = $this->get_master_group();
+        $this->groupList = $this->getGroupList();
+        $this->courseList = $this->getCourseList();
+        $this->full_course_list = $this->master_group->full_course_list;
+        $this->atomics = ($this->master_group->sub_groups) ? $this->getAtomics() : [];
+        $this->sub_options = $this->sub_options();
+        $this->filter_groups = $this->get_filter_groups();
+    }
+    
+    private function get_filter_groups()
+    {
+        $fGroups = query_array_col("SELECT filterGroupID FROM programHasFilterGroup WHERE programID = $this->db_id","filterGroupID");
+        if($fGroups)
+        {
+            foreach($fGroups as $id)
+            {
+                $result[] = new Prereq_Group($id);
+            }
+            return $result;
+        }
+        else
+        {
+            return false;
+        }
+    }
+    
+    
+    private function sub_options() {
+        $sub_options = [];
+        if (!$this->groupList)
+            return;
+        foreach ($this->groupList as $sub_group) {
+            if ($sub_group->type == '1')
+                foreach ($sub_group->sub_groups as $option)
+                    $sub_option_ids[$sub_group->db_id][$option->db_id] = $option->display_name;
+        }
+
+        return $sub_option_ids;
+    }
+
+    // Returns a Prereq_Group Object of the master group for a program
+    protected function get_master_group() {
+        return new Prereq_Group(DB::query_value("SELECT groupID FROM `groups` WHERE parentProgramID = '" . $this->db_id . "'", "groupID"));
+    }
+
+    
+    // Returns a Prereq_Group Object array of all the groups connected to the master group (if any)
+    protected function getGroupList() {
+        return $this->master_group->sub_groups;
+    }
+    
+  
+    //sorts two program objects by the count of their course lists, ascending
+    public static function sortByCourseListCountAsc($b, $a) 
+    {
+        if(count($a->course_list) == count($b->course_list)){ return 0 ; }
+            return (count($a->course_list) < count($b->course_list)) ? -1 : 1;
+    }
+    
+    //returns a list of courses directly attached to this program
+    protected function getCourseList() {
+        $course_list = DB::query_array_col("SELECT courseID FROM `groupHasGroupOrCourse` WHERE groupID = '" . $this->db_id . "'", "courseID");
+
+        if (!$course_list)
+            return false;
+
+        foreach ($course_list as $courseID)
+            $course[] = new Course($courseID);
+    }
+
+    // Returns a Course Object array of all the courses in the program
+    public function get_full_course_list() {
+        // Get courses connected directly to the program (should always be none)
+        $full_course_list = (is_array($this->courseList)) ? $this->courseList : [];
+        
+        return array_merge($full_course_list, $this->master_group->get_full_course_list());
+        
+        // If there are no subgroups, return
+        if(!is_array($this->groupList)) return $full_course_list;
+        
+        // Iterate through all the subgroups and collect all the course
+        foreach ($this->groupList as $sub_group)
+            if ($sub_group->full_course_list){
+                $full_course_list = array_merge($full_course_list, $sub_group->get_full_course_list());
+            }
+        return $full_course_list;
+    }
+    
+    //return atomic groups (groups with only courses and no child groups attached) attached to target program
+    private function getAtomics(){
+        foreach($this->master_group->sub_groups as $g)
+            if($g->sub_groups){ 
+                $nonAtomics[] = $g->db_id;           
+                foreach($g->sub_groups as $sg)    
+                    $atomics[] = $sg->db_id;
+            }
+            else
+            $atomics[] = $g->db_id;
+     
+        if(!$atomics) return false;
+
+        foreach($atomics as $atomicID)
+            $atomics_unsorted[] = new Prereq_Group($atomicID);
+        
+        foreach($atomics_unsorted as $atomic)
+            $atomics2[$atomic->name] = $atomic;
+        
+        return $atomics2;
+    }
+
+
+
+    //returns an array of atomic group objects attached to a gen ed object. For each group, if it's complete, its remCredits value is null. Otherwise, its remCredits  is remaining credits
+    //completion is tested against the $geTaken list parameter
+    public function get_areas_compl($geTaken, $areas)
+    {
+        $atomRem = [];
+        $count1 = 0;
+        //foreach atomic, attach it to atomics remaining, except for Foreign Lang 111 if it's not required and SKA4 if it's not required
+        if ($areas) {
+            foreach ($areas as $g) {
+                $atomRem[$count1] = $g;
+                $count1++;
+            }
+        }
+        usort($atomRem, 'Program::sortByCourseListCountAsc');
+        $ct = 0;
+        $temp = $geTaken;
+
+        //initialize array to track updated input course list after courses are removed  
+        $list = $geTaken;
+
+        if ($atomRem) {
+            array_filter($atomRem);
+        }
+
+        $list = $geTaken;
+
+        //********// Round 1 - if a course only belongs to one group and completes it, the course fulfills that particular group,
+        // so remove the course from available and the group from remaining. If a course only belongs to one group but does not complete it, it will be dealt with in Round 3
+        //if input course array has any elements
+        if ($geTaken) {
+            //for each course on that list
+            foreach ($geTaken as $id) {
+
+                $mem;
+
+                //if that course can be found on the list array
+                $p = array_search($id, $list);
+                if ($p OR $list[$p] == $id) {
+                    $hasCount = 0;
+                    $c = new Course($id);
+
+                    //for each atomic remaining
+                    foreach ($atomRem as $g) {
+
+
+                        //if that atomic has the course at hand on its course list, . 
+                        $ind = array_search($id, $g->full_course_list);
+                        if ($ind OR $g->full_course_list[$ind] == $id) {
+
+                            //set keep equal to that atomic
+                            $hasCount++;
+
+                            //Increase hasCount (count of groups that have the course at hand)
+                            $keep = $g;
+                        }
+                    }
+
+                    //if only one group has the course at hand
+                    if ($hasCount == 1) {
+
+                        //if the credits of the course at hand are enough to complete the group
+                        if ($c->credit >= $keep->req_credits) {
+                            //complete the group by adding it to the complete array, keeping its remCredits at null
+                            $geAC[] = $keep;
+
+                            //remove the course at hand from list as no other gen ed can be satisfied with it
+                            unset($list[array_search($id, $list)]);
+                        }
+                    }
+                }
+            }
+        }
+
+        //remove completed atomics from atomics remaining
+        //if the completed groups array has elements
+        if ($geAC) {
+            //for each completed group
+            foreach ($geAC as $g) {
+                //if that group exists on the atomics remaining array
+                $ind = array_search($g, $atomRem);
+                if (array_search($g, $atomRem) OR $atomRem[$ind] == $g) {
+                    //remove it from atomRem
+                    unset($atomRem[$ind]);
+                }
+            }
+        }
+        if ($list) {
+            array_filter($list);
+        }
+
+        //initialize tracker for updated 'list'
+        $temp2 = $list;
+        usort($atomRem, 'Program::sortByCourseListCountAsc');
+        //********************//Round 2 - for the remaining courses and groups, if a certain course completes a certain group without exceeding its credits, 
+        //that course fulfills that group. update available course and remaining atomics arrays accordingly
+        //if list has elements
+        if ($list) {
+
+            //for each course on it
+            foreach ($list as $c) {
+
+                $crs = new Course($c);
+                $cnt = 0;
+
+                //for each atomic group remaining
+                foreach ($atomRem as $a) {
+
+                    //if this course can be found on this group's course list
+                    $ind = array_search($c, $a->full_course_list);
+                    if ($ind OR $a->full_course_list[$ind] == $c) {
+
+                        //if this course's credit satisfies (without exceeding) this group's required credits,
+                        if ($crs->credit >= $a->req_credits) {
+
+                            //complete the group by adding to to completed and removing it from separate reminaing array
+                            $geAC[] = $a;
+                            unset($atomRem[array_search($a, $atomRem)]);
+
+                            //remove this course from temp2 (list of courses that havent been used to fulfill another group)
+                            unset($temp2[array_search($c, $temp2)]);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if ($temp2) {
+            array_filter($temp2);
+        }
+
+        if ($atomRem) {
+            array_filter($atomRem);
+        }
+
+        $temp3 = $temp2;
+
+        //************************//Round 3 - for the remaining groups, add all courses to it from avail that are on its course list, updating credits gained each time.
+        //if total credits equals required, courses fulfill group so update arrays accordingly. If total exceeds required, for each course, remove it if the remainder still satisfies req
+        //and update arrays accordingly
+
+        usort($atomRem, 'Program::sortByCourseListCountAsc');
+        //for each of the atomics remaining from the previous round
+        foreach ($atomRem as $a) {
+
+            if ($a->db_id) {
+
+                $credit = 0;
+
+                if ($temp3) {
+
+                    //for each course remaining
+                    foreach ($temp3 as $t) {
+
+                        $c = new Course($t);
+
+                        //if the course is on atomic's list
+                        $ind = array_search($t, $a->full_course_list);
+                        if ($ind OR $a->course_list[$ind] == $c) {
+                            //add course's credit to running total
+                            $credit += $c->credit;
+
+                            //add this course to memory array
+                            $mem[] = $c;
+                        }
+                    }
+                    //if its total credit equals req without exceeding, courses fulfill group
+                    if ($credit == $a->req_credits) {
+
+                        //remove all memory courses added to reach req from remaining courses
+                        if ($mem) {
+                            foreach ($mem as $m) {
+                                unset($temp3[array_search($m->db_id, $temp3)]);
+                            }
+                        }
+
+                        //add group to complete and remove from remain
+                        $geAC[] = $a;
+                        unset($atomRem[array_search($a, $atomRem)]);
+                    }
+                }
+            }
+        }
+
+        if ($temp3) {
+            array_filter($temp3);
+        }
+
+        if ($atomRem) {
+            array_filter($atomRem);
+        }
+
+        $temp4 = $temp3;
+        $mem;
+
+
+        usort($atomRem, 'Program::sortByCourseListCountAsc');
+        //******************//Round 4 - the only groups that remain are ones that cannot be completed. For each rem course, find any group that has it and use all other avail courses
+        //that are also on that group's cours list toward its fulfillment. Add these incomplete groups to the groups array as well, each with an updated remCredits value
+        //if courses remain
+        if ($temp3) {
+
+            $credit;
+            //for each course
+            foreach ($temp3 as $t) {
+                $keep = false;
+                $credit = 0;
+                $c = new Course($t);
+                //for each atom rem, find the first one that has the course
+                foreach ($atomRem as $a) {
+
+                    //if the course is on that atomic's c list, keep = that atomic
+                    $ind = array_search($t, $a->full_course_list);
+                    if ($ind OR $a->full_course_list[$ind] == $t) {
+
+                        if ($geAC) {
+
+                            if (!array_search($a, $geAC)) {
+
+                                $keep = $a;
+                                break;
+                            }
+                        } else {
+
+                            $keep = $a;
+                            break;
+                        }
+                    }
+                }
+
+                //if any group has this course
+                if ($keep) {
+
+
+                    $credit = $c->credit;
+
+                    //remove current course from temp list of rem courses
+                    unset($temp4[array_search($t, $temp4)]);
+
+                    //look through the remaining courses minus course at hand
+                    foreach ($temp4 as $te) {
+                        $co = new Course($te);
+
+                        //if this is not SA4-core
+                        if ($keep->req_credits > 0) {
+
+                            //if this groups credits not yet met
+                            if ($credit < $keep->req_credits) {
+
+                                //if this course is on this group's list
+                                $ind = array_search($te, $keep->full_course_list);
+                                if ($ind OR $keep->full_course_list[$ind] == $te) {
+                                    //put this course toward this group's fulfillment
+                                    $credit += $co->credit;
+                                    $mem[] = $co;
+                                }
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+
+                    //if not SA4-core and credit equals req
+                    if ($credit == $keep->req_credits) {
+
+                        $mem[] = $c;
+
+                        //remove all courses used toward fulfill from avail
+                        foreach ($mem as $m) {
+                            unset($temp3[array_search($m->db_id, $temp3)]);
+                        }
+
+                        //group complete
+                        $geAC[] = $keep;
+                        unset($atomRem[array_search($keep, $atomRem)]);
+                    }
+
+                    //otherwise if not SA4-core and credit exceeds req
+                    else if ($credit > $keep->req_credits) {
+
+
+                        //sort courses added by credit desc
+                        usort($mem, 'GenEd::sortByCredit');
+
+                        //for each course added toward fulfill
+                        foreach ($mem as $m) {
+                            $result = $credit - $m->credit;
+
+                            //if the course can be removed and credits still met
+                            if ($result >= $keep->req_credits) {
+                                //remove the course and its credit from fulfill for this group
+                                $credit -= $m->credit;
+                                unset($mem[array_search($m, $mem)]);
+                            }
+                        }
+
+                        //group complete
+                        $geAC[] = $keep;
+                        unset($atomRem[array_search($keep, $atomRem)]);
+
+                        //remove all courses used from avail
+                        $mem[] = $c;
+                        foreach ($mem as $m) {
+                            unset($temp3[array_search($m->db_id, $temp3)]);
+                        }
+                    }
+
+                    //othwewise if not SA4-core and credits not met
+                    else if ($credit < $keep->req_credits) {
+                        //add incomplete group to output array, except with its remCredits value set appropriately (complete groups will have null for this value in output array)
+                        $keep->remCredits = $keep->req_credits - $credit;
+                        $geAC[] = $keep;
+                    }
+                }
+            }
+        }
+
+        array_filter($atomRem);
+        //for each atomic remaining 
+        if ($atomRem) {
+
+            foreach ($atomRem as $a) {
+
+
+                if ($geAC) {
+                    $ind = array_search($a, $geAC);
+                }
+
+                //if this atomic is also on groups complete array (meaning it had no courses put toward its fulfillment and  still requires full credits)
+                if (!$ind AND $geAC[$ind] != $a) {
+                    //if it's not SA4-core, set remCredits = req
+                    if ($a->req_credits > 0) {
+                        $a->remCredits = $a->req_credits;
+                    }
+                    //incomplete group with proper remCredits added to groups array
+                    $geAC[] = $a;
+                }
+            }
+        }
+
+        //return groups array of all atomics. If the particular atomic is complete, it's remCredits is null. If it is  partially incomplete, remCredits are reflective. 
+        //If it is totally incomplete (no courses used towards its fulfillment), remCredits = full req credits
+        if ($geAC) {
+
+            return $geAC;
+        } else {
+            return [];
+        }
+    }
+
+}
